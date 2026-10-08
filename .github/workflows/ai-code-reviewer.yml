@@ -1,0 +1,206 @@
+name: Java AI Code Reviewer
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    types: [ opened, synchronize, reopened ]
+    branches: [ main, master, develop ]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    name: Review Java Code Changes
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract Java Diff
+        id: git-diff
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            echo "Calculating PR diff between $BASE_SHA and $HEAD_SHA"
+            DIFF=$(git diff "$BASE_SHA"..."$HEAD_SHA" -- '*.java')
+          else
+            BEFORE_SHA="${{ github.event.before }}"
+            ZERO_SHA="0000000000000000000000000000000000000000"
+            if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "$ZERO_SHA" ]; then
+              DIFF=$(git diff HEAD~1 HEAD -- '*.java' || true)
+            else
+              DIFF=$(git diff "$BEFORE_SHA" HEAD -- '*.java' || true)
+            fi
+          fi
+
+          if [ -z "$DIFF" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No Java file modifications found in this push/PR."
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            # Save diff to a temporary file for the review script
+            echo "$DIFF" > pr_diff.patch
+            echo "Found Java changes ($(wc -l < pr_diff.patch) lines)"
+          fi
+
+      - name: Run AI Review with Gemini
+        if: steps.git-diff.outputs.has_changes == 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO_NAME: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 - << 'PYEOF'
+          import os
+          import json
+          import urllib.request
+          import urllib.error
+
+          api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+          model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
+
+          if not api_key:
+              report = """## 🤖 Automated Java Code Review Report
+          > ⚠️ **Warning**: `GEMINI_API_KEY` secret is not configured in this repository.
+          Please add `GEMINI_API_KEY` to **Settings -> Secrets and variables -> Actions** to activate automated AI code reviews."""
+              with open("review_report.md", "w") as f:
+                  f.write(report)
+              exit(0)
+
+          with open("pr_diff.patch", "r") as f:
+              diff_content = f.read()
+
+          system_prompt = """You are a Principal Java Software Engineer and Lead Code Reviewer.
+          Your task is to review the provided Java git diff strictly against Standard Java Coding Guidelines:
+          
+          1. **Google Java Style & Formatting**:
+             - Casing: PascalCase for types/records, camelCase for methods/variables, UPPER_SNAKE_CASE for constants.
+             - Imports: Strictly NO wildcard imports (`import java.util.*`). Clean ordering.
+             - Meaningful naming without cryptic abbreviations.
+          
+          2. **OOP & SOLID Principles**:
+             - Single Responsibility: classes/methods focused; flag methods > 40-50 lines.
+             - Open/Closed: favor polymorphism/strategy over nested conditionals.
+             - Liskov Substitution, Interface Segregation, Dependency Inversion.
+          
+          3. **Effective Java & Best Practices**:
+             - Favor immutability (`final`, Java `record` for DTOs).
+             - Compliance with `equals()` and `hashCode()` contract.
+             - Defensive copying of mutable objects.
+             - Favor composition over inheritance.
+          
+          4. **Modern Java (Java 17/21+)**:
+             - Use `record` for data carriers.
+             - Pattern matching for `switch` and `instanceof`.
+             - Safe `Optional` usage (never call `.get()` without check).
+             - Clean Stream API pipelines without side-effects.
+          
+          5. **Resource Management & Exception Handling**:
+             - Strictly enforce `try-with-resources` for `AutoCloseable` streams/connections.
+             - Prohibit swallowed exceptions (e.g. empty catch blocks).
+             - Catch specific exceptions rather than `catch (Throwable)` or generic `catch (Exception)`.
+          
+          6. **Concurrency & Thread Safety**:
+             - Thread safety of shared state (`ConcurrentHashMap`, atomic classes).
+             - No manual unmanaged thread creation without pools.
+          
+          7. **Security (OWASP Top 10 for Java)**:
+             - Parameterized queries / JPA parameters (NO raw SQL string concatenation).
+             - Path traversal and deserialization precautions.
+             - Zero hardcoded secrets/passwords/API tokens.
+             - Safe logging (no passwords or PII).
+          
+          8. **Performance & Memory**:
+             - Use `StringBuilder` in loops.
+             - Collection pre-sizing.
+             - Avoid memory leaks.
+          
+          Format the output strictly as Markdown:
+          ## 🤖 Automated Java Code Review Report
+          ### 📊 Executive Summary
+          - **Overall Code Health**: [A+ / A / B / C / D / F] (Score: X/10)
+          - **Summary**: Concise 2-3 sentence overview.
+          
+          ### 🚨 Critical / Blocker Issues
+          *(Security vulnerabilities, resource leaks, data loss, concurrency bugs)*
+          - **File**: `path/to/File.java` (Line X)
+            - **Issue**: Description
+            - **Standard Violated**: Rule
+            - **Remediation**:
+            ```java
+            // Code snippet
+            ```
+          *(If none, state "No critical issues identified.")*
+          
+          ### ⚠️ Major Improvements
+          *(SOLID violations, swallowed exceptions, bad design, improper Optional/Stream)*
+          *(If none, state "No major improvements needed.")*
+          
+          ### 💡 Minor & Code Style Suggestions
+          *(Formatting, naming, modern Java idioms, imports)*
+          
+          ### 📋 Actionable Checklist for Developer
+          - [ ] Task
+          """
+
+          user_prompt = f"Please review this Java git diff:\n\n```diff\n{diff_content}\n```"
+
+          url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+          payload = {
+              "system_instruction": {"parts": [{"text": system_prompt}]},
+              "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+              "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4096}
+          }
+
+          req = urllib.request.Request(
+              url,
+              data=json.dumps(payload).encode("utf-8"),
+              headers={"Content-Type": "application/json"}
+          )
+
+          try:
+              with urllib.request.urlopen(req) as response:
+                  res_data = json.loads(response.read().decode("utf-8"))
+                  report_text = res_data["candidates"][0]["content"]["parts"][0]["text"]
+                  with open("review_report.md", "w") as f:
+                      f.write(report_text)
+                  print("AI Code Review Report generated successfully.")
+          except Exception as e:
+              err_msg = f"## 🤖 Automated Java Code Review Report\n\n> ⚠️ **Error contacting Gemini API**: {str(e)}"
+              with open("review_report.md", "w") as f:
+                  f.write(err_msg)
+              print(f"Error calling Gemini: {e}")
+          PYEOF
+
+      - name: Publish Review to GitHub Step Summary
+        if: steps.git-diff.outputs.has_changes == 'true'
+        run: |
+          cat review_report.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Post Comment to Pull Request
+        if: steps.git-diff.outputs.has_changes == 'true' && github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr comment "$PR_NUMBER" --body-file review_report.md
+
+      - name: Post Comment to Commit
+        if: steps.git-diff.outputs.has_changes == 'true' && github.event_name == 'push'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          gh api "repos/${{ github.repository }}/commits/$COMMIT_SHA/comments" \
+            -f body="$(cat review_report.md)" || echo "Note: Commit comment skipped or already commented."
