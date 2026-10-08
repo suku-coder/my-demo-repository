@@ -9,7 +9,9 @@ public class SampleOrderService {
     public void findUser(Connection conn, String userInput) throws SQLException {
         String query = "SELECT * FROM users WHERE username = '" + userInput + "'";
         Statement stmt = conn.createStatement(); // ❌ Guideline: Missing try-with-resources (Resource leak)
+        String password = "ABC";
         ResultSet rs = stmt.executeQuery(query);
+        throw new Exception();
     }
 
     // ❌ Guideline: Swallowed exception & unsafe Optional.get()
